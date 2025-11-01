@@ -8,6 +8,19 @@ import (
 	"strings"
 )
 
+// Helper functions for binary serialization
+func appendUint16(buf []byte, value uint16) []byte {
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, value)
+	return append(buf, b...)
+}
+
+func appendUint32(buf []byte, value uint32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, value)
+	return append(buf, b...)
+}
+
 // DNSHeader represents the header section of a DNS message
 type DNSHeader struct {
 	ID      uint16 // Packet Identifier
@@ -122,21 +135,9 @@ type DNSQuestion struct {
 
 // ToBytes serializes the DNS question to bytes
 func (q *DNSQuestion) ToBytes() []byte {
-	buf := make([]byte, 0)
-
-	// Add the domain name (already in label format)
-	buf = append(buf, q.Name...)
-
-	// Add Type (2 bytes, big-endian)
-	typeBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(typeBytes, q.Type)
-	buf = append(buf, typeBytes...)
-
-	// Add Class (2 bytes, big-endian)
-	classBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(classBytes, q.Class)
-	buf = append(buf, classBytes...)
-
+	buf := append([]byte{}, q.Name...)
+	buf = appendUint16(buf, q.Type)
+	buf = appendUint16(buf, q.Class)
 	return buf
 }
 
@@ -287,35 +288,109 @@ type DNSRecord struct {
 
 // ToBytes serializes the DNS record to bytes
 func (r *DNSRecord) ToBytes() []byte {
-	buf := make([]byte, 0)
-
-	// Add the domain name (already in label format)
-	buf = append(buf, r.Name...)
-
-	// Add Type (2 bytes, big-endian)
-	typeBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(typeBytes, r.Type)
-	buf = append(buf, typeBytes...)
-
-	// Add Class (2 bytes, big-endian)
-	classBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(classBytes, r.Class)
-	buf = append(buf, classBytes...)
-
-	// Add TTL (4 bytes, big-endian)
-	ttlBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(ttlBytes, r.TTL)
-	buf = append(buf, ttlBytes...)
-
-	// Add Length (2 bytes, big-endian)
-	lengthBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lengthBytes, r.Length)
-	buf = append(buf, lengthBytes...)
-
-	// Add Data (RDATA)
+	buf := append([]byte{}, r.Name...)
+	buf = appendUint16(buf, r.Type)
+	buf = appendUint16(buf, r.Class)
+	buf = appendUint32(buf, r.TTL)
+	buf = appendUint16(buf, r.Length)
 	buf = append(buf, r.Data...)
-
 	return buf
+}
+
+// createDefaultAnswer creates a default A record answer pointing to 8.8.8.8
+func createDefaultAnswer(question *DNSQuestion) *DNSRecord {
+	return &DNSRecord{
+		Name:   question.Name,
+		Type:   question.Type,
+		Class:  question.Class,
+		TTL:    60,
+		Length: 4,
+		Data:   []byte{8, 8, 8, 8},
+	}
+}
+
+// parseQuestionsFromMessage parses questions from a DNS message
+func parseQuestionsFromMessage(data []byte, header *DNSHeader) []*DNSQuestion {
+	questions := make([]*DNSQuestion, 0)
+	offset := 12 // Start after the header
+
+	for i := 0; i < int(header.QDCOUNT); i++ {
+		question, newOffset := ParseDNSQuestion(data, offset)
+		if question != nil {
+			questions = append(questions, question)
+			offset = newOffset
+		}
+	}
+
+	return questions
+}
+
+// buildResponsePacket builds a complete DNS response packet
+func buildResponsePacket(queryHeader *DNSHeader, questions []*DNSQuestion, answers []*DNSRecord) []byte {
+	// Determine RCODE based on OPCODE
+	rcode := uint8(0)
+	if queryHeader.OPCODE != 0 {
+		rcode = 4 // Not implemented
+	}
+
+	// Create DNS response header
+	header := DNSHeader{
+		ID:      queryHeader.ID,
+		QR:      true,
+		OPCODE:  queryHeader.OPCODE,
+		AA:      false,
+		TC:      false,
+		RD:      queryHeader.RD,
+		RA:      false,
+		Z:       0,
+		RCODE:   rcode,
+		QDCOUNT: uint16(len(questions)),
+		ANCOUNT: uint16(len(answers)),
+		NSCOUNT: 0,
+		ARCOUNT: 0,
+	}
+
+	// Build the response
+	response := header.ToBytes()
+
+	// Add all questions to the response
+	for _, question := range questions {
+		response = append(response, question.ToBytes()...)
+	}
+
+	// Add all answers to the response
+	for _, answer := range answers {
+		response = append(response, answer.ToBytes()...)
+	}
+
+	return response
+}
+
+// getAnswersForQuestions generates answers for the given questions
+// If resolverAddr is provided, forwards queries to resolver; otherwise returns default answers
+func getAnswersForQuestions(questions []*DNSQuestion, resolverAddr string) []*DNSRecord {
+	answers := make([]*DNSRecord, 0)
+
+	if resolverAddr != "" && strings.TrimSpace(resolverAddr) != "" {
+		// Forward mode: forward each question to the resolver
+		fmt.Println("Forwarding queries to resolver...")
+		for _, question := range questions {
+			forwardedAnswers, err := ForwardQuery(question, resolverAddr)
+			if err != nil {
+				fmt.Printf("Error forwarding query: %v\n", err)
+				answers = append(answers, createDefaultAnswer(question))
+			} else {
+				answers = append(answers, forwardedAnswers...)
+			}
+		}
+	} else {
+		// Direct mode: create default answers
+		for _, question := range questions {
+			answers = append(answers, createDefaultAnswer(question))
+		}
+	}
+
+	return answers
 }
 
 // ForwardQuery forwards a DNS query with a single question to the resolver
@@ -443,97 +518,14 @@ func main() {
 		fmt.Printf("Query ID: %d, OPCODE: %d, RD: %v\n", queryHeader.ID, queryHeader.OPCODE, queryHeader.RD)
 
 		// Parse questions from the query
-		questions := make([]*DNSQuestion, 0)
-		offset := 12 // Start after the header
-
-		for i := 0; i < int(queryHeader.QDCOUNT); i++ {
-			question, newOffset := ParseDNSQuestion(queryData, offset)
-			if question != nil {
-				questions = append(questions, question)
-				offset = newOffset
-			}
-		}
-
+		questions := parseQuestionsFromMessage(queryData, queryHeader)
 		fmt.Printf("Parsed %d questions from query\n", len(questions))
 
-		// Create answer records for each question
-		answers := make([]*DNSRecord, 0)
+		// Get answers for all questions
+		answers := getAnswersForQuestions(questions, *resolverAddr)
 
-		if *resolverAddr != "" && strings.TrimSpace(*resolverAddr) != "" {
-			// Forward mode: forward each question to the resolver
-			fmt.Println("Forwarding queries to resolver...")
-			for _, question := range questions {
-				forwardedAnswers, err := ForwardQuery(question, *resolverAddr)
-				if err != nil {
-					fmt.Printf("Error forwarding query: %v\n", err)
-					// Create a default answer on error
-					answer := &DNSRecord{
-						Name:   question.Name,
-						Type:   question.Type,
-						Class:  question.Class,
-						TTL:    60,
-						Length: 4,
-						Data:   []byte{8, 8, 8, 8},
-					}
-					answers = append(answers, answer)
-				} else {
-					answers = append(answers, forwardedAnswers...)
-				}
-			}
-		} else {
-			// Direct mode: create default answers
-			for _, question := range questions {
-				// Create an A record answer
-				// Using 8.8.8.8 as the IP address
-				answer := &DNSRecord{
-					Name:   question.Name,
-					Type:   question.Type,
-					Class:  question.Class,
-					TTL:    60,                 // 60 seconds
-					Length: 4,                  // IPv4 address is 4 bytes
-					Data:   []byte{8, 8, 8, 8}, // 8.8.8.8
-				}
-				answers = append(answers, answer)
-			}
-		}
-
-		// Determine RCODE based on OPCODE
-		// 0 (no error) if OPCODE is 0 (standard query)
-		// 4 (not implemented) for other OPCODE values
-		rcode := uint8(0)
-		if queryHeader.OPCODE != 0 {
-			rcode = 4 // Not implemented
-		}
-
-		// Create DNS response header
-		header := DNSHeader{
-			ID:      queryHeader.ID,     // Mirror the ID from the query
-			QR:      true,               // This is a response
-			OPCODE:  queryHeader.OPCODE, // Mirror OPCODE from query
-			AA:      false,
-			TC:      false,
-			RD:      queryHeader.RD, // Mirror RD from query
-			RA:      false,
-			Z:       0,
-			RCODE:   rcode,                  // 0 for standard query, 4 otherwise
-			QDCOUNT: uint16(len(questions)), // Number of questions
-			ANCOUNT: uint16(len(answers)),   // Number of answers
-			NSCOUNT: 0,
-			ARCOUNT: 0,
-		}
-
-		// Build the response
-		response := header.ToBytes()
-
-		// Add all questions to the response
-		for _, question := range questions {
-			response = append(response, question.ToBytes()...)
-		}
-
-		// Add all answers to the response
-		for _, answer := range answers {
-			response = append(response, answer.ToBytes()...)
-		}
+		// Build the response packet
+		response := buildResponsePacket(queryHeader, questions, answers)
 
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
