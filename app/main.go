@@ -159,6 +159,49 @@ func ParseDNSQuestion(buf []byte, offset int) (*DNSQuestion, int) {
 	}, pos
 }
 
+// DNSRecord represents a resource record in the answer/authority/additional sections
+type DNSRecord struct {
+	Name   []byte // Domain name as a sequence of labels
+	Type   uint16 // Record type
+	Class  uint16 // Record class
+	TTL    uint32 // Time to live in seconds
+	Length uint16 // Length of RDATA
+	Data   []byte // Record data (RDATA)
+}
+
+// ToBytes serializes the DNS record to bytes
+func (r *DNSRecord) ToBytes() []byte {
+	buf := make([]byte, 0)
+
+	// Add the domain name (already in label format)
+	buf = append(buf, r.Name...)
+
+	// Add Type (2 bytes, big-endian)
+	typeBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(typeBytes, r.Type)
+	buf = append(buf, typeBytes...)
+
+	// Add Class (2 bytes, big-endian)
+	classBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(classBytes, r.Class)
+	buf = append(buf, classBytes...)
+
+	// Add TTL (4 bytes, big-endian)
+	ttlBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(ttlBytes, r.TTL)
+	buf = append(buf, ttlBytes...)
+
+	// Add Length (2 bytes, big-endian)
+	lengthBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(lengthBytes, r.Length)
+	buf = append(buf, lengthBytes...)
+
+	// Add Data (RDATA)
+	buf = append(buf, r.Data...)
+
+	return buf
+}
+
 func main() {
 	fmt.Println("Logs from your program will appear here!")
 
@@ -210,6 +253,22 @@ func main() {
 
 		fmt.Printf("Parsed %d questions from query\n", len(questions))
 
+		// Create answer records for each question
+		answers := make([]*DNSRecord, 0)
+		for _, question := range questions {
+			// Create an A record answer
+			// Using 8.8.8.8 as the IP address
+			answer := &DNSRecord{
+				Name:   question.Name,
+				Type:   question.Type,
+				Class:  question.Class,
+				TTL:    60,                 // 60 seconds
+				Length: 4,                  // IPv4 address is 4 bytes
+				Data:   []byte{8, 8, 8, 8}, // 8.8.8.8
+			}
+			answers = append(answers, answer)
+		}
+
 		// Create DNS response header
 		header := DNSHeader{
 			ID:      1234, // Expected value
@@ -222,7 +281,7 @@ func main() {
 			Z:       0,
 			RCODE:   0,                      // No error
 			QDCOUNT: uint16(len(questions)), // Number of questions
-			ANCOUNT: 0,
+			ANCOUNT: uint16(len(answers)),   // Number of answers
 			NSCOUNT: 0,
 			ARCOUNT: 0,
 		}
@@ -233,6 +292,11 @@ func main() {
 		// Add all questions to the response
 		for _, question := range questions {
 			response = append(response, question.ToBytes()...)
+		}
+
+		// Add all answers to the response
+		for _, answer := range answers {
+			response = append(response, answer.ToBytes()...)
 		}
 
 		_, err = udpConn.WriteToUDP(response, source)
