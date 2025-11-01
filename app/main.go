@@ -71,6 +71,46 @@ func (h *DNSHeader) ToBytes() []byte {
 	return buf
 }
 
+// ParseDNSHeader parses a DNS header from the buffer
+func ParseDNSHeader(buf []byte) *DNSHeader {
+	if len(buf) < 12 {
+		return nil
+	}
+
+	header := &DNSHeader{}
+
+	// Bytes 0-1: ID
+	header.ID = binary.BigEndian.Uint16(buf[0:2])
+
+	// Byte 2: QR(1) | OPCODE(4) | AA(1) | TC(1) | RD(1)
+	byte2 := buf[2]
+	header.QR = (byte2 & 0x80) != 0     // Bit 7
+	header.OPCODE = (byte2 >> 3) & 0x0F // Bits 3-6
+	header.AA = (byte2 & 0x04) != 0     // Bit 2
+	header.TC = (byte2 & 0x02) != 0     // Bit 1
+	header.RD = (byte2 & 0x01) != 0     // Bit 0
+
+	// Byte 3: RA(1) | Z(3) | RCODE(4)
+	byte3 := buf[3]
+	header.RA = (byte3 & 0x80) != 0 // Bit 7
+	header.Z = (byte3 >> 4) & 0x07  // Bits 4-6
+	header.RCODE = byte3 & 0x0F     // Bits 0-3
+
+	// Bytes 4-5: QDCOUNT
+	header.QDCOUNT = binary.BigEndian.Uint16(buf[4:6])
+
+	// Bytes 6-7: ANCOUNT
+	header.ANCOUNT = binary.BigEndian.Uint16(buf[6:8])
+
+	// Bytes 8-9: NSCOUNT
+	header.NSCOUNT = binary.BigEndian.Uint16(buf[8:10])
+
+	// Bytes 10-11: ARCOUNT
+	header.ARCOUNT = binary.BigEndian.Uint16(buf[10:12])
+
+	return header
+}
+
 // DNSQuestion represents a question in the question section
 type DNSQuestion struct {
 	Name  []byte // Domain name as a sequence of labels
@@ -232,12 +272,14 @@ func main() {
 		// Parse the incoming DNS query
 		queryData := buf[:size]
 
-		// Parse the header from the query (first 12 bytes)
-		var queryHeader DNSHeader
-		if size >= 12 {
-			queryHeader.ID = binary.BigEndian.Uint16(queryData[0:2])
-			queryHeader.QDCOUNT = binary.BigEndian.Uint16(queryData[4:6])
+		// Parse the header from the query
+		queryHeader := ParseDNSHeader(queryData)
+		if queryHeader == nil {
+			fmt.Println("Failed to parse DNS header")
+			continue
 		}
+
+		fmt.Printf("Query ID: %d, OPCODE: %d, RD: %v\n", queryHeader.ID, queryHeader.OPCODE, queryHeader.RD)
 
 		// Parse questions from the query
 		questions := make([]*DNSQuestion, 0)
@@ -269,17 +311,25 @@ func main() {
 			answers = append(answers, answer)
 		}
 
+		// Determine RCODE based on OPCODE
+		// 0 (no error) if OPCODE is 0 (standard query)
+		// 4 (not implemented) for other OPCODE values
+		rcode := uint8(0)
+		if queryHeader.OPCODE != 0 {
+			rcode = 4 // Not implemented
+		}
+
 		// Create DNS response header
 		header := DNSHeader{
-			ID:      1234, // Expected value
-			QR:      true, // This is a response
-			OPCODE:  0,    // Standard query
+			ID:      queryHeader.ID,     // Mirror the ID from the query
+			QR:      true,               // This is a response
+			OPCODE:  queryHeader.OPCODE, // Mirror OPCODE from query
 			AA:      false,
 			TC:      false,
-			RD:      false,
+			RD:      queryHeader.RD, // Mirror RD from query
 			RA:      false,
 			Z:       0,
-			RCODE:   0,                      // No error
+			RCODE:   rcode,                  // 0 for standard query, 4 otherwise
 			QDCOUNT: uint16(len(questions)), // Number of questions
 			ANCOUNT: uint16(len(answers)),   // Number of answers
 			NSCOUNT: 0,
