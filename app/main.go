@@ -71,6 +71,94 @@ func (h *DNSHeader) ToBytes() []byte {
 	return buf
 }
 
+// DNSQuestion represents a question in the question section
+type DNSQuestion struct {
+	Name  []byte // Domain name as a sequence of labels
+	Type  uint16 // Query type
+	Class uint16 // Query class
+}
+
+// ToBytes serializes the DNS question to bytes
+func (q *DNSQuestion) ToBytes() []byte {
+	buf := make([]byte, 0)
+
+	// Add the domain name (already in label format)
+	buf = append(buf, q.Name...)
+
+	// Add Type (2 bytes, big-endian)
+	typeBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(typeBytes, q.Type)
+	buf = append(buf, typeBytes...)
+
+	// Add Class (2 bytes, big-endian)
+	classBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(classBytes, q.Class)
+	buf = append(buf, classBytes...)
+
+	return buf
+}
+
+// ParseDomainName parses a domain name from the buffer starting at offset
+// Returns the domain name bytes and the new offset
+func ParseDomainName(buf []byte, offset int) ([]byte, int) {
+	name := make([]byte, 0)
+	pos := offset
+
+	for {
+		if pos >= len(buf) {
+			break
+		}
+
+		length := buf[pos]
+		if length == 0 {
+			// Null byte terminates the domain name
+			name = append(name, 0)
+			pos++
+			break
+		}
+
+		// Add the length byte
+		name = append(name, length)
+		pos++
+
+		// Add the label content
+		if pos+int(length) <= len(buf) {
+			name = append(name, buf[pos:pos+int(length)]...)
+			pos += int(length)
+		} else {
+			break
+		}
+	}
+
+	return name, pos
+}
+
+// ParseDNSQuestion parses a DNS question from the buffer starting at offset
+func ParseDNSQuestion(buf []byte, offset int) (*DNSQuestion, int) {
+	// Parse domain name
+	name, pos := ParseDomainName(buf, offset)
+
+	// Parse Type (2 bytes)
+	if pos+2 > len(buf) {
+		return nil, pos
+	}
+	qType := binary.BigEndian.Uint16(buf[pos : pos+2])
+	pos += 2
+
+	// Parse Class (2 bytes)
+	if pos+2 > len(buf) {
+		return nil, pos
+	}
+	qClass := binary.BigEndian.Uint16(buf[pos : pos+2])
+	pos += 2
+
+	return &DNSQuestion{
+		Name:  name,
+		Type:  qType,
+		Class: qClass,
+	}, pos
+}
+
 func main() {
 	fmt.Println("Logs from your program will appear here!")
 
@@ -98,7 +186,31 @@ func main() {
 
 		fmt.Printf("Received %d bytes from %s\n", size, source)
 
-		// Create DNS response header with expected values
+		// Parse the incoming DNS query
+		queryData := buf[:size]
+
+		// Parse the header from the query (first 12 bytes)
+		var queryHeader DNSHeader
+		if size >= 12 {
+			queryHeader.ID = binary.BigEndian.Uint16(queryData[0:2])
+			queryHeader.QDCOUNT = binary.BigEndian.Uint16(queryData[4:6])
+		}
+
+		// Parse questions from the query
+		questions := make([]*DNSQuestion, 0)
+		offset := 12 // Start after the header
+
+		for i := 0; i < int(queryHeader.QDCOUNT); i++ {
+			question, newOffset := ParseDNSQuestion(queryData, offset)
+			if question != nil {
+				questions = append(questions, question)
+				offset = newOffset
+			}
+		}
+
+		fmt.Printf("Parsed %d questions from query\n", len(questions))
+
+		// Create DNS response header
 		header := DNSHeader{
 			ID:      1234, // Expected value
 			QR:      true, // This is a response
@@ -108,14 +220,20 @@ func main() {
 			RD:      false,
 			RA:      false,
 			Z:       0,
-			RCODE:   0, // No error
-			QDCOUNT: 0,
+			RCODE:   0,                      // No error
+			QDCOUNT: uint16(len(questions)), // Number of questions
 			ANCOUNT: 0,
 			NSCOUNT: 0,
 			ARCOUNT: 0,
 		}
 
+		// Build the response
 		response := header.ToBytes()
+
+		// Add all questions to the response
+		for _, question := range questions {
+			response = append(response, question.ToBytes()...)
+		}
 
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
