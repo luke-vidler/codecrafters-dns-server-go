@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"net"
+	"strings"
 )
 
 // DNSHeader represents the header section of a DNS message
@@ -229,6 +231,50 @@ func ParseDNSQuestion(buf []byte, offset int) (*DNSQuestion, int) {
 	}, pos
 }
 
+// ParseDNSRecord parses a DNS resource record from the buffer starting at offset
+func ParseDNSRecord(buf []byte, offset int) (*DNSRecord, int) {
+	// Parse domain name
+	name, pos := ParseDomainName(buf, offset)
+
+	// Need at least 10 more bytes for Type, Class, TTL, Length
+	if pos+10 > len(buf) {
+		return nil, pos
+	}
+
+	// Parse Type (2 bytes)
+	rType := binary.BigEndian.Uint16(buf[pos : pos+2])
+	pos += 2
+
+	// Parse Class (2 bytes)
+	rClass := binary.BigEndian.Uint16(buf[pos : pos+2])
+	pos += 2
+
+	// Parse TTL (4 bytes)
+	ttl := binary.BigEndian.Uint32(buf[pos : pos+4])
+	pos += 4
+
+	// Parse Length (2 bytes)
+	length := binary.BigEndian.Uint16(buf[pos : pos+2])
+	pos += 2
+
+	// Parse Data
+	if pos+int(length) > len(buf) {
+		return nil, pos
+	}
+	data := make([]byte, length)
+	copy(data, buf[pos:pos+int(length)])
+	pos += int(length)
+
+	return &DNSRecord{
+		Name:   name,
+		Type:   rType,
+		Class:  rClass,
+		TTL:    ttl,
+		Length: length,
+		Data:   data,
+	}, pos
+}
+
 // DNSRecord represents a resource record in the answer/authority/additional sections
 type DNSRecord struct {
 	Name   []byte // Domain name as a sequence of labels
@@ -272,8 +318,93 @@ func (r *DNSRecord) ToBytes() []byte {
 	return buf
 }
 
+// ForwardQuery forwards a DNS query with a single question to the resolver
+// Returns the answer records from the resolver's response
+func ForwardQuery(question *DNSQuestion, resolverAddr string) ([]*DNSRecord, error) {
+	// Create a DNS query packet with a single question
+	queryHeader := DNSHeader{
+		ID:      1234, // Use a fixed ID for forwarded queries
+		QR:      false,
+		OPCODE:  0,
+		AA:      false,
+		TC:      false,
+		RD:      true, // Request recursion
+		RA:      false,
+		Z:       0,
+		RCODE:   0,
+		QDCOUNT: 1,
+		ANCOUNT: 0,
+		NSCOUNT: 0,
+		ARCOUNT: 0,
+	}
+
+	// Build the query packet
+	queryPacket := queryHeader.ToBytes()
+	queryPacket = append(queryPacket, question.ToBytes()...)
+
+	// Resolve the resolver address
+	udpAddr, err := net.ResolveUDPAddr("udp", resolverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve resolver address: %v", err)
+	}
+
+	// Create a UDP connection
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to resolver: %v", err)
+	}
+	defer conn.Close()
+
+	// Send the query
+	_, err = conn.Write(queryPacket)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send query to resolver: %v", err)
+	}
+
+	// Receive the response
+	responseBuf := make([]byte, 512)
+	n, err := conn.Read(responseBuf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response from resolver: %v", err)
+	}
+
+	responseData := responseBuf[:n]
+
+	// Parse the response header
+	responseHeader := ParseDNSHeader(responseData)
+	if responseHeader == nil {
+		return nil, fmt.Errorf("failed to parse response header")
+	}
+
+	// Skip past the header and questions in the response
+	offset := 12
+	for i := 0; i < int(responseHeader.QDCOUNT); i++ {
+		_, newOffset := ParseDNSQuestion(responseData, offset)
+		offset = newOffset
+	}
+
+	// Parse the answer records
+	answers := make([]*DNSRecord, 0)
+	for i := 0; i < int(responseHeader.ANCOUNT); i++ {
+		record, newOffset := ParseDNSRecord(responseData, offset)
+		if record != nil {
+			answers = append(answers, record)
+			offset = newOffset
+		}
+	}
+
+	return answers, nil
+}
+
 func main() {
+	// Parse command-line arguments
+	resolverAddr := flag.String("resolver", "", "DNS resolver address (e.g., 8.8.8.8:53)")
+	flag.Parse()
+
 	fmt.Println("Logs from your program will appear here!")
+	if *resolverAddr != "" {
+		fmt.Printf("Using resolver: %s\n", *resolverAddr)
+	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:2053")
 	if err != nil {
@@ -327,18 +458,43 @@ func main() {
 
 		// Create answer records for each question
 		answers := make([]*DNSRecord, 0)
-		for _, question := range questions {
-			// Create an A record answer
-			// Using 8.8.8.8 as the IP address
-			answer := &DNSRecord{
-				Name:   question.Name,
-				Type:   question.Type,
-				Class:  question.Class,
-				TTL:    60,                 // 60 seconds
-				Length: 4,                  // IPv4 address is 4 bytes
-				Data:   []byte{8, 8, 8, 8}, // 8.8.8.8
+
+		if *resolverAddr != "" && strings.TrimSpace(*resolverAddr) != "" {
+			// Forward mode: forward each question to the resolver
+			fmt.Println("Forwarding queries to resolver...")
+			for _, question := range questions {
+				forwardedAnswers, err := ForwardQuery(question, *resolverAddr)
+				if err != nil {
+					fmt.Printf("Error forwarding query: %v\n", err)
+					// Create a default answer on error
+					answer := &DNSRecord{
+						Name:   question.Name,
+						Type:   question.Type,
+						Class:  question.Class,
+						TTL:    60,
+						Length: 4,
+						Data:   []byte{8, 8, 8, 8},
+					}
+					answers = append(answers, answer)
+				} else {
+					answers = append(answers, forwardedAnswers...)
+				}
 			}
-			answers = append(answers, answer)
+		} else {
+			// Direct mode: create default answers
+			for _, question := range questions {
+				// Create an A record answer
+				// Using 8.8.8.8 as the IP address
+				answer := &DNSRecord{
+					Name:   question.Name,
+					Type:   question.Type,
+					Class:  question.Class,
+					TTL:    60,                 // 60 seconds
+					Length: 4,                  // IPv4 address is 4 bytes
+					Data:   []byte{8, 8, 8, 8}, // 8.8.8.8
+				}
+				answers = append(answers, answer)
+			}
 		}
 
 		// Determine RCODE based on OPCODE
