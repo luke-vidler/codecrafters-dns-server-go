@@ -139,10 +139,13 @@ func (q *DNSQuestion) ToBytes() []byte {
 }
 
 // ParseDomainName parses a domain name from the buffer starting at offset
-// Returns the domain name bytes and the new offset
+// Returns the uncompressed domain name bytes and the new offset
+// Handles DNS name compression (pointers) according to RFC 1035 section 4.1.4
 func ParseDomainName(buf []byte, offset int) ([]byte, int) {
 	name := make([]byte, 0)
 	pos := offset
+	jumped := false
+	jumpPos := 0
 
 	for {
 		if pos >= len(buf) {
@@ -150,6 +153,28 @@ func ParseDomainName(buf []byte, offset int) ([]byte, int) {
 		}
 
 		length := buf[pos]
+
+		// Check if this is a compression pointer (top 2 bits are 11)
+		if length&0xC0 == 0xC0 {
+			// This is a pointer
+			if pos+1 >= len(buf) {
+				break
+			}
+
+			// The pointer is 14 bits: current byte (lower 6 bits) + next byte
+			pointer := int(binary.BigEndian.Uint16(buf[pos:pos+2]) & 0x3FFF)
+
+			// If we haven't jumped yet, save the position to return
+			if !jumped {
+				jumpPos = pos + 2
+				jumped = true
+			}
+
+			// Follow the pointer
+			pos = pointer
+			continue
+		}
+
 		if length == 0 {
 			// Null byte terminates the domain name
 			name = append(name, 0)
@@ -170,6 +195,11 @@ func ParseDomainName(buf []byte, offset int) ([]byte, int) {
 		}
 	}
 
+	// If we jumped, return the position after the pointer
+	// Otherwise return the current position
+	if jumped {
+		return name, jumpPos
+	}
 	return name, pos
 }
 
